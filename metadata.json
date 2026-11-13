@@ -1,0 +1,6 @@
+{
+  "name": "QR Talk",
+  "description": "QRコードをiPhoneで読み取ってトークルームを開き、最大5,000文字の文章をリアルタイムでPC画面に送信・反映できるアプリ。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
