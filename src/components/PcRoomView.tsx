@@ -1,9 +1,19 @@
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
+  type FormEvent,
+  type KeyboardEvent,
+} from 'react';
 import {
   Check,
   Copy,
   Download,
   ExternalLink,
+  ImagePlus,
   Maximize2,
   Monitor,
   Send,
@@ -14,8 +24,18 @@ import {
   X,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import { MAX_MESSAGE_LENGTH, type ChatMessage } from '../types/chat';
+import {
+  MAX_IMAGES_PER_MESSAGE,
+  MAX_MESSAGE_LENGTH,
+  type ChatImage,
+  type ChatMessage,
+} from '../types/chat';
 import { useRoomSocket } from '../hooks/useRoomSocket';
+import {
+  copyChatImageToClipboard,
+  downloadChatImage,
+  processImageFile,
+} from '../utils/imageProcessor';
 import { QrCodeDisplay } from './QrCodeDisplay';
 
 interface PcRoomViewProps {
@@ -52,12 +72,19 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
 
   const [copiedUrl, setCopiedUrl] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [copiedImageId, setCopiedImageId] = useState<string | null>(null);
   const [isQrModalOpen, setIsQrModalOpen] = useState(false);
+  const [previewImage, setPreviewImage] = useState<ChatImage | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [draft, setDraft] = useState('');
+  const [pendingImages, setPendingImages] = useState<ChatImage[]>([]);
+  const [isProcessingImages, setIsProcessingImages] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isDownloadingZip, setIsDownloadingZip] = useState(false);
 
   const feedEndRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
   const prevCountRef = useRef(0);
 
@@ -71,6 +98,15 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
   useEffect(() => {
     setConfirmClear(false);
   }, [roomId]);
+
+  useEffect(() => {
+    if (!previewImage) return;
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') setPreviewImage(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [previewImage]);
 
   const handleCopyUrl = async () => {
     try {
@@ -118,9 +154,85 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
     }
   };
 
+  const handleCopyImage = async (img: ChatImage) => {
+    const ok = await copyChatImageToClipboard(img);
+    if (ok) {
+      setCopiedImageId(img.id);
+      window.setTimeout(() => {
+        setCopiedImageId((prev) => (prev === img.id ? null : prev));
+      }, 1800);
+    }
+  };
+
+  const addImageFiles = async (files: FileList | File[]) => {
+    const fileArray = Array.from(files).filter((f) => f.type.startsWith('image/'));
+    if (fileArray.length === 0) return;
+
+    const remainingSlots = MAX_IMAGES_PER_MESSAGE - pendingImages.length;
+    if (remainingSlots <= 0) {
+      setLocalError(`画像は一度に${MAX_IMAGES_PER_MESSAGE}枚まで送信できます。`);
+      return;
+    }
+
+    const targets = fileArray.slice(0, remainingSlots);
+    if (fileArray.length > remainingSlots) {
+      setLocalError(
+        `画像は一度に${MAX_IMAGES_PER_MESSAGE}枚まで添付できます（先頭${remainingSlots}枚を追加しました）。`
+      );
+    } else {
+      setLocalError(null);
+    }
+
+    setIsProcessingImages(true);
+    try {
+      const processed: ChatImage[] = [];
+      for (const file of targets) {
+        processed.push(await processImageFile(file));
+      }
+      setPendingImages((prev) => [...prev, ...processed].slice(0, MAX_IMAGES_PER_MESSAGE));
+    } catch (err) {
+      setLocalError(
+        err instanceof Error ? err.message : '画像の読み込みに失敗しました。'
+      );
+    } finally {
+      setIsProcessingImages(false);
+    }
+  };
+
+  const handleFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      await addImageFiles(e.target.files);
+    }
+    e.target.value = '';
+  };
+
+  const handlePaste = async (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const imageFiles: File[] = [];
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) imageFiles.push(f);
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault();
+      await addImageFiles(imageFiles);
+    }
+  };
+
+  const handleDrop = async (e: DragEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setIsDraggingOver(false);
+    if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+      await addImageFiles(e.dataTransfer.files);
+    }
+  };
+
   const handleDraftChange = (value: string) => {
     const clipped = value.slice(0, MAX_MESSAGE_LENGTH);
     setDraft(clipped);
+    setLocalError(null);
     if (errorMessage) clearError();
 
     if (clipped.trim().length > 0) {
@@ -137,14 +249,19 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
   };
 
   const submitPcMessage = () => {
-    if (draft.trim().length === 0) return;
-    const res = sendMessage(draft);
+    if (isProcessingImages) return;
+    if (draft.trim().length === 0 && pendingImages.length === 0) return;
+    const res = sendMessage(draft, pendingImages);
     if (res.ok) {
       setDraft('');
+      setPendingImages([]);
+      setLocalError(null);
       sendTyping(false);
       if (typingTimeoutRef.current !== null) {
         window.clearTimeout(typingTimeoutRef.current);
       }
+    } else if (res.error) {
+      setLocalError(res.error);
     }
   };
 
@@ -159,6 +276,8 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
       submitPcMessage();
     }
   };
+
+  const activeError = localError || errorMessage;
 
   const mobileTyping = otherTypingUsers.some((u) => u.role === 'mobile');
   const charCount = draft.length;
@@ -298,11 +417,11 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
             </li>
             <li className="flex items-baseline gap-2.5">
               <span className="font-mono font-semibold text-slate-400 tabular-nums shrink-0">02.</span>
-              <span>開いたトークルームから5,000文字以内の文章を送信</span>
+              <span>開いたトークルームから文章（5,000文字以内）や画像を送信</span>
             </li>
             <li className="flex items-baseline gap-2.5">
               <span className="font-mono font-semibold text-slate-400 tabular-nums shrink-0">03.</span>
-              <span>右側の画面へリアルタイムで文章が反映されます</span>
+              <span>右側の画面へリアルタイムで内容が反映されます</span>
             </li>
           </ol>
         </aside>
@@ -377,76 +496,156 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
                   iPhoneからの送信を待機しています
                 </h3>
                 <p className="mt-2 text-sm text-slate-600 leading-relaxed">
-                  左のQRコードをiPhoneで読み取り、トークルームから文章を送信すると、ここにリアルタイムで全文が表示されます（最大5,000文字）。
+                  左のQRコードをiPhoneで読み取り、トークルームから文章（最大5,000文字）や画像を送信すると、ここにリアルタイムで表示されます。
                 </p>
               </div>
             ) : (
               <AnimatePresence initial={false}>
-                {messages.map((msg) => (
-                  <motion.article
-                    key={msg.id}
-                    initial={{ opacity: 0, y: 8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
-                    className={`rounded-xl border p-5 ${
-                      msg.role === 'mobile'
-                        ? 'bg-slate-50/70 border-slate-200'
-                        : 'bg-blue-50/40 border-blue-200/80'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-4 pb-3 border-b border-slate-200/70">
-                      <div className="flex items-center gap-2 text-xs text-slate-500 min-w-0">
-                        <span className="font-semibold text-slate-900 truncate">
-                          {msg.senderName}
-                        </span>
-                        <span aria-hidden="true">·</span>
-                        <time
-                          dateTime={new Date(msg.createdAt).toISOString()}
-                          className="font-mono tabular-nums shrink-0"
-                        >
-                          {formatTime(msg.createdAt)}
-                        </time>
-                        <span aria-hidden="true">·</span>
-                        <span className="font-mono tabular-nums shrink-0">
-                          {msg.text.length.toLocaleString()}文字
-                        </span>
-                      </div>
-
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => handleCopyMessage(msg)}
-                          className="min-h-[32px] px-2.5 py-1 inline-flex items-center gap-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer whitespace-nowrap"
-                        >
-                          {copiedMessageId === msg.id ? (
+                {messages.map((msg) => {
+                  const hasText = msg.text.trim().length > 0;
+                  const hasImages = Boolean(msg.images && msg.images.length > 0);
+                  return (
+                    <motion.article
+                      key={msg.id}
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -4 }}
+                      transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+                      className={`rounded-xl border p-5 ${
+                        msg.role === 'mobile'
+                          ? 'bg-slate-50/70 border-slate-200'
+                          : 'bg-blue-50/40 border-blue-200/80'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-4 pb-3 border-b border-slate-200/70">
+                        <div className="flex items-center gap-2 text-xs text-slate-500 min-w-0">
+                          <span className="font-semibold text-slate-900 truncate">
+                            {msg.senderName}
+                          </span>
+                          <span aria-hidden="true">·</span>
+                          <time
+                            dateTime={new Date(msg.createdAt).toISOString()}
+                            className="font-mono tabular-nums shrink-0"
+                          >
+                            {formatTime(msg.createdAt)}
+                          </time>
+                          {hasText && (
                             <>
-                              <Check className="w-3.5 h-3.5 text-emerald-600" aria-hidden="true" />
-                              <span>コピー済み</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
-                              <span>コピー</span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono tabular-nums shrink-0">
+                                {msg.text.length.toLocaleString()}文字
+                              </span>
                             </>
                           )}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => deleteMessage(msg.id)}
-                          className="min-h-[32px] min-w-[32px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 hover:bg-white rounded-lg transition-colors cursor-pointer"
-                          aria-label="このメッセージを削除"
-                        >
-                          <Trash2 className="w-4 h-4" aria-hidden="true" />
-                        </button>
-                      </div>
-                    </div>
+                          {hasImages && msg.images && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono tabular-nums shrink-0">
+                                画像{msg.images.length}枚
+                              </span>
+                            </>
+                          )}
+                        </div>
 
-                    <div className="mt-3 text-[15px] leading-relaxed text-slate-900 whitespace-pre-wrap break-words">
-                      {msg.text}
-                    </div>
-                  </motion.article>
-                ))}
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {hasText && (
+                            <button
+                              type="button"
+                              onClick={() => handleCopyMessage(msg)}
+                              className="min-h-[32px] px-2.5 py-1 inline-flex items-center gap-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors cursor-pointer whitespace-nowrap"
+                            >
+                              {copiedMessageId === msg.id ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-600" aria-hidden="true" />
+                                  <span>コピー済み</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
+                                  <span>コピー</span>
+                                </>
+                              )}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => deleteMessage(msg.id)}
+                            className="min-h-[32px] min-w-[32px] inline-flex items-center justify-center text-slate-400 hover:text-red-600 hover:bg-white rounded-lg transition-colors cursor-pointer"
+                            aria-label="このメッセージを削除"
+                          >
+                            <Trash2 className="w-4 h-4" aria-hidden="true" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {hasImages && msg.images && (
+                        <div
+                          className={`mt-3 grid gap-3 ${
+                            msg.images.length === 1 ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2'
+                          }`}
+                        >
+                          {msg.images.map((img) => (
+                            <div
+                              key={img.id}
+                              className="rounded-xl border border-slate-200 bg-white overflow-hidden"
+                            >
+                              <button
+                                type="button"
+                                onClick={() => setPreviewImage(img)}
+                                className="w-full block bg-slate-100/70 hover:opacity-95 transition-opacity cursor-zoom-in focus-visible:outline-2 focus-visible:outline-blue-600"
+                                aria-label={`${img.name}を拡大表示`}
+                              >
+                                <img
+                                  src={img.dataUrl}
+                                  alt={img.name}
+                                  className="w-full max-h-[420px] object-contain mx-auto block"
+                                />
+                              </button>
+                              <div className="px-3 py-2 border-t border-slate-200/80 flex items-center justify-between gap-2 bg-white">
+                                <span className="text-xs font-mono text-slate-500 truncate">
+                                  {img.name}
+                                </span>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCopyImage(img)}
+                                    className="px-2 py-1 inline-flex items-center gap-1 text-xs font-medium text-slate-700 hover:bg-slate-100 rounded-md transition-colors cursor-pointer whitespace-nowrap"
+                                  >
+                                    {copiedImageId === img.id ? (
+                                      <>
+                                        <Check className="w-3.5 h-3.5 text-emerald-600" aria-hidden="true" />
+                                        <span>コピー済</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
+                                        <span>画像コピー</span>
+                                      </>
+                                    )}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => downloadChatImage(img)}
+                                    className="px-2 py-1 inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:bg-blue-50 rounded-md transition-colors cursor-pointer whitespace-nowrap"
+                                  >
+                                    <Download className="w-3.5 h-3.5" aria-hidden="true" />
+                                    <span>保存</span>
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {hasText && (
+                        <div className="mt-3 text-[15px] leading-relaxed text-slate-900 whitespace-pre-wrap break-words">
+                          {msg.text}
+                        </div>
+                      )}
+                    </motion.article>
+                  );
+                })}
               </AnimatePresence>
             )}
             <div ref={feedEndRef} />
@@ -455,51 +654,125 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
           {/* Optional PC Reply Bar */}
           <form
             onSubmit={handleSubmit}
-            className="p-4 border-t border-slate-200 bg-slate-50/50 rounded-b-2xl"
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDraggingOver(true);
+            }}
+            onDragLeave={() => setIsDraggingOver(false)}
+            onDrop={handleDrop}
+            className={`p-4 border-t border-slate-200 rounded-b-2xl transition-colors ${
+              isDraggingOver ? 'bg-blue-50/70' : 'bg-slate-50/50'
+            }`}
           >
-            {errorMessage && (
+            {activeError && (
               <p className="mb-2 text-xs font-medium text-red-600" role="alert">
-                {errorMessage}
+                {activeError}
               </p>
             )}
+
+            {pendingImages.length > 0 && (
+              <div className="mb-3 flex flex-wrap items-center gap-2.5">
+                {pendingImages.map((img) => (
+                  <div key={img.id} className="relative w-16 h-16">
+                    <img
+                      src={img.dataUrl}
+                      alt={img.name}
+                      className="w-16 h-16 rounded-xl object-cover border border-slate-200 bg-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPendingImages((prev) => prev.filter((item) => item.id !== img.id))
+                      }
+                      aria-label={`${img.name}を削除`}
+                      className="absolute -top-1.5 -right-1.5 w-6 h-6 rounded-full bg-slate-900 text-white flex items-center justify-center shadow-xs cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" aria-hidden="true" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={handleFileChange}
+              className="hidden"
+            />
+
             <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-end">
               <div className="flex-1">
-                <div className="flex items-center justify-between mb-1.5">
+                <div className="flex items-center justify-between mb-1.5 gap-2">
                   <label htmlFor="pc-reply-input" className="text-xs font-medium text-slate-600">
-                    PCからトークルームへ送信（Ctrl / ⌘ + Enterで送信）
+                    PCからトークルームへ送信（画像の貼り付け・ドロップ / Ctrl+Enter対応）
                   </label>
-                  <span
-                    className={`text-xs font-mono tabular-nums ${
-                      charCount >= MAX_MESSAGE_LENGTH
-                        ? 'text-red-600 font-semibold'
-                        : charCount >= 4500
-                          ? 'text-amber-600 font-medium'
-                          : 'text-slate-500'
-                    }`}
-                  >
-                    {charCount.toLocaleString()} / {MAX_MESSAGE_LENGTH.toLocaleString()}
-                  </span>
+                  <div className="flex items-center gap-2 text-xs font-mono tabular-nums shrink-0">
+                    {pendingImages.length > 0 && (
+                      <>
+                        <span className="text-blue-600 font-medium">
+                          画像 {pendingImages.length}/{MAX_IMAGES_PER_MESSAGE}枚
+                        </span>
+                        <span aria-hidden="true" className="text-slate-300">
+                          ·
+                        </span>
+                      </>
+                    )}
+                    <span
+                      className={
+                        charCount >= MAX_MESSAGE_LENGTH
+                          ? 'text-red-600 font-semibold'
+                          : charCount >= 4500
+                            ? 'text-amber-600 font-medium'
+                            : 'text-slate-500'
+                      }
+                    >
+                      {charCount.toLocaleString()} / {MAX_MESSAGE_LENGTH.toLocaleString()}
+                    </span>
+                  </div>
                 </div>
                 <textarea
                   id="pc-reply-input"
                   value={draft}
                   onChange={(e) => handleDraftChange(e.target.value)}
                   onKeyDown={handleKeyDown}
+                  onPaste={handlePaste}
                   maxLength={MAX_MESSAGE_LENGTH}
                   rows={2}
-                  placeholder="PC側からiPhoneへ文章やURLを送ることもできます…"
+                  placeholder={
+                    isProcessingImages
+                      ? '画像を読み込み中…'
+                      : 'PC側からiPhoneへ文章や画像を送ることもできます…'
+                  }
                   className="w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 resize-y"
                 />
               </div>
 
-              <button
-                type="submit"
-                disabled={draft.trim().length === 0}
-                className="min-h-[44px] px-5 py-2.5 inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
-              >
-                <Send className="w-4 h-4" aria-hidden="true" />
-                <span>送信</span>
-              </button>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isProcessingImages || pendingImages.length >= MAX_IMAGES_PER_MESSAGE}
+                  className="min-h-[44px] px-3.5 py-2.5 inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white text-slate-700 text-sm font-medium hover:bg-slate-50 disabled:opacity-40 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                >
+                  <ImagePlus className="w-4 h-4" aria-hidden="true" />
+                  <span>画像</span>
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={
+                    isProcessingImages ||
+                    (draft.trim().length === 0 && pendingImages.length === 0)
+                  }
+                  className="min-h-[44px] px-5 py-2.5 inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 transition-colors cursor-pointer disabled:cursor-not-allowed whitespace-nowrap shrink-0"
+                >
+                  <Send className="w-4 h-4" aria-hidden="true" />
+                  <span>送信</span>
+                </button>
+              </div>
             </div>
           </form>
         </section>
@@ -542,6 +815,69 @@ export function PcRoomView({ roomId, roomUrl, onCreateNewRoom }: PcRoomViewProps
                 iPhoneのカメラを向けてトークルームを開きます
               </p>
             </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      {/* Image Lightbox Modal */}
+      <AnimatePresence>
+        {previewImage && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-xs flex flex-col p-6"
+            onClick={() => setPreviewImage(null)}
+          >
+            <div
+              className="max-w-5xl w-full mx-auto flex items-center justify-between gap-4 pb-4 text-white shrink-0"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <span className="text-sm font-mono truncate">{previewImage.name}</span>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleCopyImage(previewImage)}
+                  className="min-h-[40px] px-3.5 inline-flex items-center gap-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-xs font-medium text-white transition-colors cursor-pointer"
+                >
+                  {copiedImageId === previewImage.id ? (
+                    <>
+                      <Check className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+                      <span>コピー済</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-4 h-4" aria-hidden="true" />
+                      <span>画像コピー</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => downloadChatImage(previewImage)}
+                  className="min-h-[40px] px-3.5 inline-flex items-center gap-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-medium text-white transition-colors cursor-pointer"
+                >
+                  <Download className="w-4 h-4" aria-hidden="true" />
+                  <span>保存する</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPreviewImage(null)}
+                  className="min-h-[40px] min-w-[40px] inline-flex items-center justify-center rounded-lg bg-white/15 hover:bg-white/25 text-white transition-colors cursor-pointer"
+                  aria-label="閉じる"
+                >
+                  <X className="w-5 h-5" aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 flex items-center justify-center min-h-0">
+              <img
+                src={previewImage.dataUrl}
+                alt={previewImage.name}
+                onClick={(e) => e.stopPropagation()}
+                className="max-w-full max-h-full object-contain rounded-xl"
+              />
+            </div>
           </motion.div>
         )}
       </AnimatePresence>

@@ -1,11 +1,23 @@
 export const MAX_MESSAGE_LENGTH = 5000;
+export const MAX_IMAGES_PER_MESSAGE = 4;
+export const MAX_IMAGE_DATA_URL_LENGTH = 2_500_000;
 
 export type DeviceRole = 'pc' | 'mobile';
+
+export interface ChatImage {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+  width?: number;
+  height?: number;
+}
 
 export interface ChatMessage {
   id: string;
   roomId: string;
   text: string;
+  images?: ChatImage[];
   senderName: string;
   role: DeviceRole;
   createdAt: number;
@@ -35,6 +47,7 @@ export type ClientWsEvent =
       id: string;
       roomId: string;
       text: string;
+      images?: ChatImage[];
       senderName: string;
       role: DeviceRole;
     }

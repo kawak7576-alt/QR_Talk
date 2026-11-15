@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  MAX_IMAGES_PER_MESSAGE,
   MAX_MESSAGE_LENGTH,
+  type ChatImage,
   type ChatMessage,
   type ClientWsEvent,
   type DeviceRole,
@@ -188,14 +190,20 @@ export function useRoomSocket({ roomId, role, senderName }: UseRoomSocketOptions
   }, [roomId, role]);
 
   const sendMessage = useCallback(
-    (text: string): { ok: boolean; error?: string } => {
-      if (text.trim().length === 0) {
-        return { ok: false, error: '文章を入力してください。' };
+    (text: string, images: ChatImage[] = []): { ok: boolean; error?: string } => {
+      if (text.trim().length === 0 && images.length === 0) {
+        return { ok: false, error: '文章または画像を選択してください。' };
       }
       if (text.length > MAX_MESSAGE_LENGTH) {
         return {
           ok: false,
           error: `${MAX_MESSAGE_LENGTH.toLocaleString()}文字以内で入力してください。`,
+        };
+      }
+      if (images.length > MAX_IMAGES_PER_MESSAGE) {
+        return {
+          ok: false,
+          error: `画像は一度に${MAX_IMAGES_PER_MESSAGE}枚まで送信できます。`,
         };
       }
 
@@ -210,6 +218,7 @@ export function useRoomSocket({ roomId, role, senderName }: UseRoomSocketOptions
         id,
         roomId,
         text,
+        ...(images.length > 0 ? { images } : {}),
         senderName: senderNameRef.current,
         role,
       });

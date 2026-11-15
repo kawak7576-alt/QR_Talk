@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { Check, Copy, Edit3, Send, Wifi, WifiOff, X } from 'lucide-react';
+import { useEffect, useRef, useState, type ChangeEvent, type ClipboardEvent, type FormEvent } from 'react';
+import { Check, Copy, Download, Edit3, ImagePlus, Send, Wifi, WifiOff, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import { MAX_MESSAGE_LENGTH, type ChatMessage } from '../types/chat';
+import { MAX_IMAGES_PER_MESSAGE, MAX_MESSAGE_LENGTH, type ChatImage, type ChatMessage } from '../types/chat';
 import { useRoomSocket } from '../hooks/useRoomSocket';
+import { downloadChatImage, processImageFile } from '../utils/imageProcessor';
 
 interface MobileTalkRoomViewProps {
   roomId: string;
@@ -35,6 +36,9 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
   const [nameInput, setNameInput] = useState(senderName);
 
   const [draft, setDraft] = useState('');
+  const [pendingImages, setPendingImages] = useState<ChatImage[]>([]);
+  const [isProcessingImages, setIsProcessingImages] = useState(false);
+  const [previewImage, setPreviewImage] = useState<ChatImage | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -54,6 +58,7 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
   });
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const feedEndRef = useRef<HTMLDivElement | null>(null);
   const typingTimerRef = useRef<number | null>(null);
 
@@ -96,16 +101,73 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
     }
   };
 
-  const handleSend = (e: FormEvent) => {
-    e.preventDefault();
-    if (draft.trim().length === 0) {
-      setLocalError('送信する文章を入力してください。');
+  const addImageFiles = async (files: FileList | File[]) => {
+    const fileArray = Array.from(files).filter((f) => f.type.startsWith('image/'));
+    if (fileArray.length === 0) return;
+
+    const remainingSlots = MAX_IMAGES_PER_MESSAGE - pendingImages.length;
+    if (remainingSlots <= 0) {
+      setLocalError(`画像は一度に${MAX_IMAGES_PER_MESSAGE}枚まで送信できます。`);
       return;
     }
 
-    const res = sendMessage(draft);
+    const targets = fileArray.slice(0, remainingSlots);
+    if (fileArray.length > remainingSlots) {
+      setLocalError(`画像は一度に${MAX_IMAGES_PER_MESSAGE}枚まで添付できます（先頭${remainingSlots}枚を追加しました）。`);
+    } else {
+      setLocalError(null);
+    }
+
+    setIsProcessingImages(true);
+    try {
+      const processed: ChatImage[] = [];
+      for (const file of targets) {
+        processed.push(await processImageFile(file));
+      }
+      setPendingImages((prev) => [...prev, ...processed].slice(0, MAX_IMAGES_PER_MESSAGE));
+    } catch (err) {
+      setLocalError(
+        err instanceof Error ? err.message : '画像の読み込みに失敗しました。'
+      );
+    } finally {
+      setIsProcessingImages(false);
+    }
+  };
+
+  const handleFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      await addImageFiles(e.target.files);
+    }
+    e.target.value = '';
+  };
+
+  const handlePaste = async (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const imageFiles: File[] = [];
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) imageFiles.push(f);
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault();
+      await addImageFiles(imageFiles);
+    }
+  };
+
+  const handleSend = (e: FormEvent) => {
+    e.preventDefault();
+    if (isProcessingImages) return;
+    if (draft.trim().length === 0 && pendingImages.length === 0) {
+      setLocalError('送信する文章または画像を入力してください。');
+      return;
+    }
+
+    const res = sendMessage(draft, pendingImages);
     if (res.ok) {
       setDraft('');
+      setPendingImages([]);
       setLocalError(null);
       sendTyping(false);
       if (typingTimerRef.current !== null) {
@@ -195,13 +257,15 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
               トークルームへようこそ
             </p>
             <p className="mt-1.5 text-xs text-slate-600 leading-relaxed max-w-xs">
-              下の入力欄から最大5,000文字の文章を送信すると、PC画面にリアルタイムで反映されます。
+              下の入力欄から最大5,000文字の文章や画像を送信すると、PC画面にリアルタイムで反映されます。
             </p>
           </div>
         ) : (
           <AnimatePresence initial={false}>
             {messages.map((msg) => {
               const isOwnSide = msg.role === 'mobile';
+              const hasImages = Boolean(msg.images && msg.images.length > 0);
+              const hasText = msg.text.trim().length > 0;
               return (
                 <motion.div
                   key={msg.id}
@@ -211,13 +275,44 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
                   className={`flex flex-col ${isOwnSide ? 'items-end' : 'items-start'}`}
                 >
                   <div
-                    className={`max-w-[88%] rounded-2xl px-4 py-3 text-[15px] leading-relaxed whitespace-pre-wrap break-words ${
+                    className={`max-w-[88%] rounded-2xl overflow-hidden ${
                       isOwnSide
                         ? 'bg-blue-600 text-white rounded-br-md'
                         : 'bg-white border border-slate-200 text-slate-900 rounded-bl-md'
                     }`}
                   >
-                    {msg.text}
+                    {hasImages && msg.images && (
+                      <div
+                        className={`grid gap-1 p-1.5 ${
+                          msg.images.length === 1 ? 'grid-cols-1' : 'grid-cols-2'
+                        }`}
+                      >
+                        {msg.images.map((img) => (
+                          <button
+                            key={img.id}
+                            type="button"
+                            onClick={() => setPreviewImage(img)}
+                            className="block overflow-hidden rounded-xl bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-600"
+                          >
+                            <img
+                              src={img.dataUrl}
+                              alt={img.name}
+                              className="w-full max-h-64 object-cover block"
+                            />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+
+                    {hasText && (
+                      <div
+                        className={`px-4 py-3 text-[15px] leading-relaxed whitespace-pre-wrap break-words ${
+                          hasImages ? 'pt-1.5' : ''
+                        }`}
+                      >
+                        {msg.text}
+                      </div>
+                    )}
                   </div>
                   <div className="mt-1 px-1 flex items-center gap-2 text-[11px] text-slate-500">
                     <span>{msg.senderName}</span>
@@ -225,11 +320,23 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
                     <time className="font-mono tabular-nums">
                       {formatShortTime(msg.createdAt)}
                     </time>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono tabular-nums">
-                      {msg.text.length.toLocaleString()}文字
-                    </span>
-                    {!isOwnSide && (
+                    {hasText && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono tabular-nums">
+                          {msg.text.length.toLocaleString()}文字
+                        </span>
+                      </>
+                    )}
+                    {hasImages && msg.images && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="font-mono tabular-nums">
+                          画像{msg.images.length}枚
+                        </span>
+                      </>
+                    )}
+                    {!isOwnSide && hasText && (
                       <button
                         type="button"
                         onClick={() => handleCopyMessage(msg)}
@@ -273,23 +380,36 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
         )}
 
         <div className="flex items-center justify-between px-1 mb-1.5">
-          <span
-            className={`text-xs font-mono tabular-nums ${
-              charCount >= MAX_MESSAGE_LENGTH
-                ? 'text-red-600 font-semibold'
-                : charCount >= 4500
-                  ? 'text-amber-600 font-medium'
-                  : 'text-slate-500'
-            }`}
-          >
-            {charCount.toLocaleString()} / {MAX_MESSAGE_LENGTH.toLocaleString()} 文字
-          </span>
+          <div className="flex items-center gap-2 text-xs font-mono tabular-nums">
+            <span
+              className={
+                charCount >= MAX_MESSAGE_LENGTH
+                  ? 'text-red-600 font-semibold'
+                  : charCount >= 4500
+                    ? 'text-amber-600 font-medium'
+                    : 'text-slate-500'
+              }
+            >
+              {charCount.toLocaleString()} / {MAX_MESSAGE_LENGTH.toLocaleString()} 文字
+            </span>
+            {pendingImages.length > 0 && (
+              <>
+                <span aria-hidden="true" className="text-slate-300">
+                  ·
+                </span>
+                <span className="text-blue-600 font-medium">
+                  画像 {pendingImages.length}/{MAX_IMAGES_PER_MESSAGE}枚
+                </span>
+              </>
+            )}
+          </div>
 
-          {draft.length > 0 && (
+          {(draft.length > 0 || pendingImages.length > 0) && (
             <button
               type="button"
               onClick={() => {
                 setDraft('');
+                setPendingImages([]);
                 setLocalError(null);
                 sendTyping(false);
                 textareaRef.current?.focus();
@@ -301,22 +421,74 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
           )}
         </div>
 
+        {/* Pending Image Previews */}
+        {pendingImages.length > 0 && (
+          <div className="flex items-center gap-2 overflow-x-auto pb-2 px-0.5">
+            {pendingImages.map((img) => (
+              <div key={img.id} className="relative shrink-0 w-16 h-16">
+                <img
+                  src={img.dataUrl}
+                  alt={img.name}
+                  className="w-16 h-16 rounded-xl object-cover border border-slate-200"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPendingImages((prev) => prev.filter((item) => item.id !== img.id))
+                  }
+                  aria-label={`${img.name}を削除`}
+                  className="absolute -top-1.5 -right-1.5 w-6 h-6 rounded-full bg-slate-900 text-white flex items-center justify-center shadow-xs"
+                >
+                  <X className="w-3.5 h-3.5" aria-hidden="true" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={handleFileChange}
+          className="hidden"
+        />
+
         <div className="flex items-end gap-2">
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isProcessingImages || pendingImages.length >= MAX_IMAGES_PER_MESSAGE}
+            aria-label="画像を添付する"
+            className="min-h-[48px] min-w-[48px] inline-flex items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-slate-700 active:bg-slate-100 disabled:opacity-40 transition-colors shrink-0"
+          >
+            <ImagePlus className="w-5 h-5" aria-hidden="true" />
+          </button>
+
           <textarea
             ref={textareaRef}
             value={draft}
             onChange={(e) => handleDraftChange(e.target.value)}
+            onPaste={handlePaste}
             maxLength={MAX_MESSAGE_LENGTH}
             rows={2}
-            placeholder="PC画面に送る文章を入力（5,000文字以内）"
+            placeholder={
+              isProcessingImages
+                ? '画像を読み込み中…'
+                : '文章（5,000文字以内）や画像を送る'
+            }
             aria-label="送信する文章（5,000文字以内）"
             className="flex-1 min-h-[48px] max-h-[144px] rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-[16px] leading-snug text-slate-900 placeholder:text-slate-400 focus:outline-none focus:bg-white focus:ring-2 focus:ring-blue-600/20 focus:border-blue-600 resize-none"
           />
 
           <button
             type="submit"
-            disabled={draft.trim().length === 0}
-            className="min-h-[48px] min-w-[76px] px-4 inline-flex items-center justify-center gap-1.5 rounded-xl bg-blue-600 text-white text-sm font-semibold active:scale-[0.98] disabled:bg-slate-200 disabled:text-slate-400 transition-all shrink-0"
+            disabled={
+              isProcessingImages ||
+              (draft.trim().length === 0 && pendingImages.length === 0)
+            }
+            className="min-h-[48px] min-w-[72px] px-3.5 inline-flex items-center justify-center gap-1.5 rounded-xl bg-blue-600 text-white text-sm font-semibold active:scale-[0.98] disabled:bg-slate-200 disabled:text-slate-400 transition-all shrink-0"
           >
             <Send className="w-4 h-4" aria-hidden="true" />
             <span>送信</span>
@@ -370,6 +542,53 @@ export function MobileTalkRoomView({ roomId }: MobileTalkRoomViewProps) {
                 保存する
               </button>
             </motion.form>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      {/* Fullscreen Image Preview Lightbox */}
+      <AnimatePresence>
+        {previewImage && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-slate-950/90 flex flex-col"
+            onClick={() => setPreviewImage(null)}
+          >
+            <div
+              className="h-14 px-4 flex items-center justify-between text-white shrink-0"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <span className="text-xs font-mono truncate max-w-[60%]">
+                {previewImage.name}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => downloadChatImage(previewImage)}
+                  className="min-h-[40px] px-3 inline-flex items-center gap-1.5 rounded-lg bg-white/15 text-xs font-medium text-white"
+                >
+                  <Download className="w-4 h-4" aria-hidden="true" />
+                  <span>保存</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPreviewImage(null)}
+                  className="min-h-[40px] min-w-[40px] inline-flex items-center justify-center rounded-lg bg-white/15 text-white"
+                  aria-label="閉じる"
+                >
+                  <X className="w-5 h-5" aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 flex items-center justify-center p-4 overflow-hidden">
+              <img
+                src={previewImage.dataUrl}
+                alt={previewImage.name}
+                className="max-w-full max-h-full object-contain rounded-lg"
+                onClick={(e) => e.stopPropagation()}
+              />
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
