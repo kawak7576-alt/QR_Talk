@@ -7,7 +7,10 @@ import JSZip from 'jszip';
 import { WebSocketServer, WebSocket } from 'ws';
 import 'dotenv/config';
 import {
+  MAX_IMAGE_DATA_URL_LENGTH,
+  MAX_IMAGES_PER_MESSAGE,
   MAX_MESSAGE_LENGTH,
+  type ChatImage,
   type ChatMessage,
   type ClientWsEvent,
   type DeviceRole,
@@ -205,7 +208,11 @@ async function startServer() {
   });
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws',
+    maxPayload: 12 * 1024 * 1024,
+  });
 
   wss.on('connection', (ws: WebSocket) => {
     const aliveState = { isAlive: true };
@@ -300,11 +307,13 @@ async function startServer() {
         }
 
         const rawText = typeof event.text === 'string' ? event.text : '';
-        if (rawText.trim().length === 0) {
+        const rawImages = Array.isArray(event.images) ? event.images : [];
+
+        if (rawText.trim().length === 0 && rawImages.length === 0) {
           sendJson(ws, {
             type: 'error',
             code: 'EMPTY_MESSAGE',
-            message: 'メッセージを入力してください。',
+            message: '文章または画像を選択してください。',
           });
           return;
         }
@@ -316,6 +325,52 @@ async function startServer() {
             message: `文章は${MAX_MESSAGE_LENGTH.toLocaleString()}文字以内で送信してください。`,
           });
           return;
+        }
+
+        if (rawImages.length > MAX_IMAGES_PER_MESSAGE) {
+          sendJson(ws, {
+            type: 'error',
+            code: 'TOO_MANY_IMAGES',
+            message: `画像は一度に${MAX_IMAGES_PER_MESSAGE}枚まで送信できます。`,
+          });
+          return;
+        }
+
+        const validatedImages: ChatImage[] = [];
+        for (const img of rawImages) {
+          if (
+            !img ||
+            typeof img !== 'object' ||
+            typeof img.dataUrl !== 'string' ||
+            img.dataUrl.length > MAX_IMAGE_DATA_URL_LENGTH ||
+            !/^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/i.test(img.dataUrl)
+          ) {
+            sendJson(ws, {
+              type: 'error',
+              code: 'INVALID_IMAGE',
+              message: '画像の形式またはサイズが不正です。',
+            });
+            return;
+          }
+
+          validatedImages.push({
+            id:
+              typeof img.id === 'string' && img.id.trim().length > 0
+                ? img.id.trim().slice(0, 64)
+                : crypto.randomUUID(),
+            name:
+              typeof img.name === 'string' && img.name.trim().length > 0
+                ? img.name.trim().slice(0, 100)
+                : 'image.jpg',
+            mimeType:
+              typeof img.mimeType === 'string' && img.mimeType.startsWith('image/')
+                ? img.mimeType.slice(0, 64)
+                : 'image/jpeg',
+            dataUrl: img.dataUrl,
+            width: typeof img.width === 'number' && Number.isFinite(img.width) ? img.width : undefined,
+            height:
+              typeof img.height === 'number' && Number.isFinite(img.height) ? img.height : undefined,
+          });
         }
 
         const room = getOrCreateRoom(roomId);
@@ -346,6 +401,7 @@ async function startServer() {
           id: messageId,
           roomId,
           text: rawText,
+          ...(validatedImages.length > 0 ? { images: validatedImages } : {}),
           senderName,
           role,
           createdAt: Date.now(),
